@@ -2,11 +2,9 @@ package handlers
 
 import (
 	"crypto/sha1"
-	"crypto/x509"
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
-	"encoding/pem"
 	"fmt"
 	"log"
 	"net/http"
@@ -67,13 +65,25 @@ func sendEmail() {
 }
 
 func validateToken(token string) (*JWTClaim, error) {
-	parsedToken, err := jwt.ParseWithClaims(token, &JWTClaim{}, func(token *jwt.Token) (interface{}, error) {
-		return []byte(publicKey), nil
+	claims := &JWTClaim{}
+
+	publicKeyInterface, _ := jwt.ParseRSAPublicKeyFromPEM([]byte(publicKey))
+
+	parsedToken, err := jwt.ParseWithClaims(token, claims, func(token *jwt.Token) (interface{}, error) {
+		return publicKeyInterface, nil
 	})
 
-	fmt.Println(parsedToken.Claims)
+	if err != nil {
+		log.Fatalf("Ошибка разбора: %v", err)
+	}
 
-	return parsedToken.Claims.(*JWTClaim), err
+	if !parsedToken.Valid {
+		log.Fatalf("Недействительный логин")
+	}
+
+	fmt.Println(parsedToken.Valid, claims.ip)
+
+	return claims, err
 }
 
 func hashData(data string) string {
@@ -207,8 +217,7 @@ func (handler *JwtHandler) RefreshTokens(writer http.ResponseWriter, request *ht
 }
 
 func getJwt(requestIpAddr string, hours int) string {
-	block, _ := pem.Decode([]byte(privateKey))
-	key, _ := x509.ParsePKCS1PrivateKey(block.Bytes)
+	key, _ := jwt.ParseRSAPrivateKeyFromPEM([]byte(privateKey))
 
 	expirationTime := jwt.NewNumericDate(time.Now().Add(time.Hour * time.Duration(hours)))
 
