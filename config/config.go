@@ -19,9 +19,9 @@ func getEnv(key, defaultValue string) string {
 
 func LoadConfig() *Config {
 	return &Config{
-		DBUser:     getEnv("DBUser", "user"),
-		DBName:     getEnv("DBName", "go-http"),
-		DBPort:     getEnv("DBPort", "5433"),
-		DBPassword: getEnv("DBPassword", "221100"),
+		DBUser:     getEnv("DBUser", "postgres"),
+		DBName:     getEnv("DBName", "http-server"),
+		DBPort:     getEnv("DBPort", "5432"),
+		DBPassword: getEnv("DBPassword", "111"),
 	}
 }

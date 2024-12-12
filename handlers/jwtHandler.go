@@ -7,8 +7,10 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
+	"fmt"
 	"log"
 	"net/http"
+	"server/models"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
@@ -51,38 +53,131 @@ type Tokens struct {
 	RefreshToken string
 }
 
-func (tokens *Tokens) getTokensHash() string {
-	hasher := sha1.New() //можно выбрать другой алгоритм исходя из требований безопасности
-	hasher.Write([]byte(tokens.AccessToken + tokens.RefreshToken))
-
-	return string(hasher.Sum(nil))
+type GetTokensBody struct {
+	GUID string
 }
 
-func (handler *JwtHandler) GetTokens(writer http.ResponseWriter, request *http.Request) {
+type JWTClaim struct {
+	ip string
+	jwt.RegisteredClaims
+}
+
+func sendEmail() {
+	log.Printf("Email sended")
+}
+
+func validateToken(token string) (*JWTClaim, error) {
+	parsedToken, err := jwt.ParseWithClaims(token, &JWTClaim{}, func(token *jwt.Token) (interface{}, error) {
+		return []byte(publicKey), nil
+	})
+
+	fmt.Println(parsedToken.Claims)
+
+	return parsedToken.Claims.(*JWTClaim), err
+}
+
+func hashData(data string) string {
+	hasher := sha1.New() //можно выбрать другой алгоритм исходя из требований безопасности
+	_, err := hasher.Write([]byte(data))
+
+	if err != nil { // переделать на !ok?
+		log.Fatalf("Something went wrong while hashing data: %v", err)
+	}
+
+	return base64.URLEncoding.EncodeToString(hasher.Sum(nil))
+}
+
+func (tokens *Tokens) getTokensHash() string {
+	return hashData(tokens.AccessToken + tokens.RefreshToken)
+}
+
+func generateTokens(writer http.ResponseWriter, requestIpAddr string) (string, string) {
 	writer.Header().Set("Content-Type", "application/json")
-
-	//requestIpAddr := request.RemoteAddr //loopback
-	requestIpAddr := request.Header.Get("X-Forwarded-For") //пользователь может установить любой header
-
-	//тут проверка на ip из базы, вынести в отдельную горутину
 
 	accessToken := getJwt(requestIpAddr, AccessTokenLifeSpanInHours)
 	refreshToken := getJwt(requestIpAddr, RefreshTokenLifeSpanInHours)
 
 	tokens := Tokens{accessToken, refreshToken}
 
-	coupledHash := tokens.getTokensHash() // + запись в бд
-	log.Printf("%x", coupledHash)
+	combinedHash := tokens.getTokensHash()
+	base64Token := base64.URLEncoding.EncodeToString([]byte(refreshToken))
 
-	base64Token := base64.URLEncoding.EncodeToString([]byte(refreshToken)) // + запись в бд
+	accessCookie := &http.Cookie{
+		Name:     "accessToken",
+		Value:    accessToken,
+		Expires:  time.Now().Add(AccessTokenLifeSpanInHours),
+		HttpOnly: true,
+		//Secure:   true, для https
+	}
 
-	responseBody := Tokens{accessToken, base64Token}
+	http.SetCookie(writer, accessCookie)
 
-	json.NewEncoder(writer).Encode(responseBody)
+	refreshCookie := &http.Cookie{
+		Name:     "refreshToken",
+		Value:    base64Token,
+		Expires:  time.Now().Add(AccessTokenLifeSpanInHours),
+		HttpOnly: true,
+		//Secure:   true, для https
+	}
+
+	http.SetCookie(writer, refreshCookie)
+
+	return base64Token, combinedHash
+}
+
+func (handler *JwtHandler) GetTokens(writer http.ResponseWriter, request *http.Request) {
+	var requestIpAddr string
+
+	accessCookie, err := request.Cookie("accessToken")
+
+	if err != nil {
+		requestIpAddr = request.Header.Get("X-Forwarded-For") //помним что пользователь может установить любой ip тут
+	} else {
+		validateToken(accessCookie.Value)
+	}
+
+	body := GetTokensBody{}
+	decoder := json.NewDecoder(request.Body)
+	decoder.DisallowUnknownFields()
+	err = decoder.Decode(&body)
+
+	if err != nil {
+		log.Fatalf("Something went wrong: %v", err) //переделать фаталы на респонсы
+	}
+
+	user := models.User{}
+	row := handler.DB.QueryRow(`SELECT * FROM "Users" WHERE "Users"."GUID" = $1`, body.GUID)
+	err = row.Scan(&user.GUID, &user.RefreshToken, &user.CombinedTokensHash, &user.IpHash, &user.Email)
+
+	if err != nil {
+		if err == sql.ErrNoRows {
+			log.Fatalf("User with such GUID not found")
+		}
+
+		log.Fatalf("Something went wrong while sql request: %v", err)
+	}
+
+	currIpHash := hashData(requestIpAddr)
+
+	if user.IpHash != "" && currIpHash != user.IpHash && user.Email != "" {
+		go sendEmail()
+	}
+
+	refreshToken, combinedTokensHash := generateTokens(writer, requestIpAddr)
+
+	_, err = handler.DB.Exec(`UPDATE "Users" SET
+		"RefreshToken" = $1,
+		"CombinedTokensHash" = $2,
+		"IpHash" = $3
+		WHERE "GUID" = $4`, refreshToken, combinedTokensHash, currIpHash, user.GUID)
+
+	if err != nil {
+		log.Fatalf("Something went wrong while sql request: %v", err)
+	}
 }
 
 func (handler *JwtHandler) RefreshTokens(writer http.ResponseWriter, request *http.Request) {
-	var tokens Tokens
+	tokens := Tokens{}
 
 	decoder := json.NewDecoder(request.Body) //в тз сказано про пару токенов, хотя зачем нам тут access непонятно
 	decoder.DisallowUnknownFields()
@@ -92,24 +187,37 @@ func (handler *JwtHandler) RefreshTokens(writer http.ResponseWriter, request *ht
 		log.Fatalf("Something went wrong: %v", decodeErr) //переделать фаталы на респонсы
 	}
 
-	_, parseError := jwt.Parse(tokens.AccessToken, func(*jwt.Token) (interface{}, error) {
-		return []byte(publicKey), nil
-	})
+	decodedToken, err := base64.URLEncoding.DecodeString(tokens.RefreshToken)
 
-	if parseError != nil {
-		log.Fatalf("Token is wrong: %v", parseError)
+	if err != nil {
+		log.Fatalf("Something went wrong: %v", err) //переделать фаталы на респонсы
 	}
 
+	_, err1 := validateToken(string(decodedToken))
+
+	if err1 != nil {
+		log.Fatalf("Something went wrong: %v", err1) //переделать фаталы на респонсы
+	}
+
+	// + читаем из базы, сравниваем с хэшем, выкидываем ошибку или выдаем новые токены
+
+	requestIpAddr := request.Header.Get("X-Forwarded-For") //можно ли переделать
+
+	generateTokens(writer, requestIpAddr)
 }
 
 func getJwt(requestIpAddr string, hours int) string {
 	block, _ := pem.Decode([]byte(privateKey))
 	key, _ := x509.ParsePKCS1PrivateKey(block.Bytes)
 
-	claims := jwt.MapClaims{}
+	expirationTime := jwt.NewNumericDate(time.Now().Add(time.Hour * time.Duration(hours)))
 
-	claims["ip"] = requestIpAddr
-	claims["exp"] = time.Now().Add(time.Hour * time.Duration(hours)).Unix()
+	claims := &JWTClaim{
+		ip: requestIpAddr,
+		RegisteredClaims: jwt.RegisteredClaims{
+			ExpiresAt: expirationTime,
+		},
+	}
 
 	token := jwt.NewWithClaims(jwt.SigningMethodRS512, claims)
 
