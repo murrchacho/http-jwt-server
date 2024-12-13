@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
-	"fmt"
 	"log"
 	"net/http"
 	"server/models"
@@ -60,11 +59,111 @@ type JWTClaim struct {
 	jwt.RegisteredClaims
 }
 
+func (handler *JwtHandler) getUser(request *http.Request) models.User {
+	body := GetTokensBody{}
+	decoder := json.NewDecoder(request.Body)
+	decoder.DisallowUnknownFields()
+	err := decoder.Decode(&body)
+
+	if err != nil {
+		log.Fatalf("Something went wrong: %v", err) //переделать фаталы на респонсы
+	}
+
+	user := models.User{}
+	row := handler.DB.QueryRow(`SELECT * FROM "Users" WHERE "Users"."GUID" = $1`, body.GUID)
+	err = row.Scan(&user.GUID, &user.RefreshToken, &user.CombinedTokensHash, &user.IpHash, &user.Email)
+
+	if err != nil {
+		if err == sql.ErrNoRows {
+			log.Fatalf("User with such GUID not found")
+		}
+
+		log.Fatalf("Something went wrong while sql request: %v", err)
+	}
+
+	return user
+}
+
+func (handler *JwtHandler) GetTokens(writer http.ResponseWriter, request *http.Request) {
+	accessCookie, err := request.Cookie("accessToken")
+
+	if err != nil {
+
+	}
+
+	claims := validateToken(accessCookie.Value)
+	requestIpAddr := request.Header.Get("X-Forwarded-For") //помним что пользователь может установить любой ip тут
+
+	cookieIpAddr := claims.ip
+
+	user := handler.getUser(request)
+
+	requestIpHash := hashData(requestIpAddr)
+	cookieIpHash := hashData(cookieIpAddr)
+
+	if requestIpHash != cookieIpHash {
+		go sendEmail()
+		log.Fatalf("Несовпадение ip")
+	}
+
+	if user.IpHash != "" && requestIpHash != user.IpHash && user.Email != "" {
+		go sendEmail()
+	}
+
+	refreshToken, combinedTokensHash := generateTokens(writer, requestIpAddr)
+
+	_, err = handler.DB.Exec(`UPDATE "Users" SET
+		"RefreshToken" = $1,
+		"CombinedTokensHash" = $2,
+		"IpHash" = $3
+		WHERE "GUID" = $4`, refreshToken, combinedTokensHash, requestIpHash, user.GUID)
+
+	if err != nil {
+		log.Fatalf("Something went wrong while sql request: %v", err)
+	}
+}
+
+func (handler *JwtHandler) RefreshTokens(writer http.ResponseWriter, request *http.Request) {
+	accessCookie, errAccessToken := request.Cookie("accessToken")
+	refreshCookie, errRefreshToken := request.Cookie("refreshToken")
+
+	if errAccessToken != nil || errRefreshToken != nil {
+		log.Fatalf("Can't get cookies from request")
+	}
+
+	decodedToken, err := base64.URLEncoding.DecodeString(refreshCookie.Value)
+
+	if err != nil {
+		log.Fatalf("Something went wrong: %v", err) //переделать фаталы на респонсы
+	}
+
+	refreshToken := string(decodedToken)
+	tokens := Tokens{accessCookie.Value, refreshToken}
+	tokensHash := tokens.getTokensHash()
+
+	user := handler.getUser(request)
+
+	if tokensHash != user.CombinedTokensHash {
+		log.Fatalf("Wrong token provided: %v", err) //переделать фаталы на респонсы
+	}
+
+	claims := validateToken(refreshToken)
+	currHashedIp := hashData(claims.ip)
+
+	if currHashedIp != user.IpHash && user.Email != "" {
+		go sendEmail()
+	}
+
+	requestIpAddr := request.Header.Get("X-Forwarded-For") //можно ли переделать
+
+	generateTokens(writer, requestIpAddr)
+}
+
 func sendEmail() {
 	log.Printf("Email sended")
 }
 
-func validateToken(token string) (*JWTClaim, error) {
+func validateToken(token string) *JWTClaim {
 	claims := &JWTClaim{}
 
 	publicKeyInterface, _ := jwt.ParseRSAPublicKeyFromPEM([]byte(publicKey))
@@ -81,9 +180,7 @@ func validateToken(token string) (*JWTClaim, error) {
 		log.Fatalf("Недействительный логин")
 	}
 
-	fmt.Println(parsedToken.Valid, claims.ip)
-
-	return claims, err
+	return claims
 }
 
 func hashData(data string) string {
@@ -133,87 +230,6 @@ func generateTokens(writer http.ResponseWriter, requestIpAddr string) (string, s
 	http.SetCookie(writer, refreshCookie)
 
 	return base64Token, combinedHash
-}
-
-func (handler *JwtHandler) GetTokens(writer http.ResponseWriter, request *http.Request) {
-	var requestIpAddr string
-
-	accessCookie, err := request.Cookie("accessToken")
-
-	if err != nil {
-		requestIpAddr = request.Header.Get("X-Forwarded-For") //помним что пользователь может установить любой ip тут
-	} else {
-		validateToken(accessCookie.Value)
-	}
-
-	body := GetTokensBody{}
-	decoder := json.NewDecoder(request.Body)
-	decoder.DisallowUnknownFields()
-	err = decoder.Decode(&body)
-
-	if err != nil {
-		log.Fatalf("Something went wrong: %v", err) //переделать фаталы на респонсы
-	}
-
-	user := models.User{}
-	row := handler.DB.QueryRow(`SELECT * FROM "Users" WHERE "Users"."GUID" = $1`, body.GUID)
-	err = row.Scan(&user.GUID, &user.RefreshToken, &user.CombinedTokensHash, &user.IpHash, &user.Email)
-
-	if err != nil {
-		if err == sql.ErrNoRows {
-			log.Fatalf("User with such GUID not found")
-		}
-
-		log.Fatalf("Something went wrong while sql request: %v", err)
-	}
-
-	currIpHash := hashData(requestIpAddr)
-
-	if user.IpHash != "" && currIpHash != user.IpHash && user.Email != "" {
-		go sendEmail()
-	}
-
-	refreshToken, combinedTokensHash := generateTokens(writer, requestIpAddr)
-
-	_, err = handler.DB.Exec(`UPDATE "Users" SET
-		"RefreshToken" = $1,
-		"CombinedTokensHash" = $2,
-		"IpHash" = $3
-		WHERE "GUID" = $4`, refreshToken, combinedTokensHash, currIpHash, user.GUID)
-
-	if err != nil {
-		log.Fatalf("Something went wrong while sql request: %v", err)
-	}
-}
-
-func (handler *JwtHandler) RefreshTokens(writer http.ResponseWriter, request *http.Request) {
-	tokens := Tokens{}
-
-	decoder := json.NewDecoder(request.Body) //в тз сказано про пару токенов, хотя зачем нам тут access непонятно
-	decoder.DisallowUnknownFields()
-	decodeErr := decoder.Decode(&tokens)
-
-	if decodeErr != nil {
-		log.Fatalf("Something went wrong: %v", decodeErr) //переделать фаталы на респонсы
-	}
-
-	decodedToken, err := base64.URLEncoding.DecodeString(tokens.RefreshToken)
-
-	if err != nil {
-		log.Fatalf("Something went wrong: %v", err) //переделать фаталы на респонсы
-	}
-
-	_, err1 := validateToken(string(decodedToken))
-
-	if err1 != nil {
-		log.Fatalf("Something went wrong: %v", err1) //переделать фаталы на респонсы
-	}
-
-	// + читаем из базы, сравниваем с хэшем, выкидываем ошибку или выдаем новые токены
-
-	requestIpAddr := request.Header.Get("X-Forwarded-For") //можно ли переделать
-
-	generateTokens(writer, requestIpAddr)
 }
 
 func getJwt(requestIpAddr string, hours int) string {

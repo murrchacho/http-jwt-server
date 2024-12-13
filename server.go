@@ -23,6 +23,7 @@ func main() {
 	jwtHandler := &handlers.JwtHandler{DB: db}
 
 	http.HandleFunc("/getTokens", jwtHandler.GetTokens)
+	http.HandleFunc("/refreshTokens", jwtHandler.RefreshTokens)
 
 	log.Printf("Server starting on port ...")
 
