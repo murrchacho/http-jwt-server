@@ -7,7 +7,7 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
-	"server/httpErrors"
+	"server/httpResponse"
 	"server/models"
 	"time"
 
@@ -85,37 +85,31 @@ func (handler *JwtHandler) getUser(request *http.Request) (models.User, error) {
 func (handler *JwtHandler) GetTokens(writer http.ResponseWriter, request *http.Request) {
 	writer.Header().Set("Content-Type", "application/json")
 
-	accessCookie, err := request.Cookie("accessToken")
-
-	if err != nil {
-		httpErrors.SendResponse(writer, "Something wenth wrong while generating access token", http.StatusBadRequest)
-		log.Println(err)
-		return
-	}
-
 	requestIpAddr := request.Header.Get("X-Forwarded-For") //может установить любой ip в этом заголовке на своей стороне
 
 	requestIpHash, err := hashData(requestIpAddr)
 
 	if err != nil {
-		httpErrors.SendResponse(writer, "Something wenth wrong while hashing data", http.StatusBadRequest)
+		httpResponse.SendResponse(writer, "Something went wrong while hashing data", http.StatusBadRequest)
 		log.Println(err)
 		return
 	}
 
 	requestIpHashDiff := false
 
+	accessCookie, err := request.Cookie("accessToken")
+
 	if err == nil {
 		claims, parsedToken, err := validateToken(accessCookie.Value)
 
 		if err != nil {
-			httpErrors.SendResponse(writer, "Something wenth wrong while validating token", http.StatusBadRequest)
+			httpResponse.SendResponse(writer, "Something went wrong while validating token", http.StatusBadRequest)
 			log.Println(err)
 			return
 		}
 
 		if !parsedToken.Valid {
-			httpErrors.SendResponse(writer, "Token is invalid", http.StatusBadRequest)
+			httpResponse.SendResponse(writer, "Token is invalid", http.StatusBadRequest)
 			return
 		}
 
@@ -123,7 +117,7 @@ func (handler *JwtHandler) GetTokens(writer http.ResponseWriter, request *http.R
 		cookieIpHash, err := hashData(cookieIpAddr)
 
 		if err != nil {
-			httpErrors.SendResponse(writer, "Something wenth wrong while hashing data", http.StatusBadRequest)
+			httpResponse.SendResponse(writer, "Something went wrong while hashing data", http.StatusBadRequest)
 			log.Println(err)
 			return
 		}
@@ -135,11 +129,11 @@ func (handler *JwtHandler) GetTokens(writer http.ResponseWriter, request *http.R
 
 	if err != nil {
 		if err == sql.ErrNoRows {
-			httpErrors.SendResponse(writer, "User with such GUID not found", http.StatusBadRequest)
+			httpResponse.SendResponse(writer, "User with such GUID not found", http.StatusBadRequest)
 			return
 		}
 
-		httpErrors.SendResponse(writer, "", http.StatusBadRequest)
+		httpResponse.SendResponse(writer, "", http.StatusBadRequest)
 		log.Println(err)
 		return
 	}
@@ -153,7 +147,7 @@ func (handler *JwtHandler) GetTokens(writer http.ResponseWriter, request *http.R
 	refreshToken, combinedTokensHash, err := generateTokens(writer, requestIpAddr)
 
 	if err != nil {
-		httpErrors.SendResponse(writer, "Something went wrong while generating access token", http.StatusBadRequest)
+		httpResponse.SendResponse(writer, "Something went wrong while generating access token", http.StatusBadRequest)
 		log.Println(err)
 		return
 	}
@@ -165,10 +159,12 @@ func (handler *JwtHandler) GetTokens(writer http.ResponseWriter, request *http.R
 		WHERE "GUID" = $4`, refreshToken, combinedTokensHash, requestIpHash, user.GUID)
 
 	if err != nil {
-		httpErrors.SendResponse(writer, "", http.StatusBadRequest)
+		httpResponse.SendResponse(writer, "", http.StatusBadRequest)
 		log.Println(err)
 		return
 	}
+
+	httpResponse.SendResponse(writer, "Your cookies are successfully set to http only", http.StatusOK)
 }
 
 func (handler *JwtHandler) RefreshTokens(writer http.ResponseWriter, request *http.Request) {
@@ -178,14 +174,14 @@ func (handler *JwtHandler) RefreshTokens(writer http.ResponseWriter, request *ht
 	refreshCookie, errRefreshToken := request.Cookie("refreshToken")
 
 	if errAccessToken != nil || errRefreshToken != nil {
-		httpErrors.SendResponse(writer, "Can't get cookies from request", http.StatusBadRequest)
+		httpResponse.SendResponse(writer, "Can't get cookies from request", http.StatusBadRequest)
 		return
 	}
 
 	decodedToken, err := base64.URLEncoding.DecodeString(refreshCookie.Value)
 
 	if err != nil {
-		httpErrors.SendResponse(writer, "", http.StatusBadRequest)
+		httpResponse.SendResponse(writer, "", http.StatusBadRequest)
 		log.Println(err)
 		return
 	}
@@ -195,7 +191,7 @@ func (handler *JwtHandler) RefreshTokens(writer http.ResponseWriter, request *ht
 	combinedHash, err := tokens.getTokensHash()
 
 	if err != nil {
-		httpErrors.SendResponse(writer, "Something went wrong while hashing tokens", http.StatusBadRequest)
+		httpResponse.SendResponse(writer, "Something went wrong while hashing tokens", http.StatusBadRequest)
 		log.Println(err)
 		return
 	}
@@ -204,11 +200,11 @@ func (handler *JwtHandler) RefreshTokens(writer http.ResponseWriter, request *ht
 
 	if err != nil {
 		if err == sql.ErrNoRows {
-			httpErrors.SendResponse(writer, "User with such GUID not found", http.StatusBadRequest)
+			httpResponse.SendResponse(writer, "User with such GUID not found", http.StatusBadRequest)
 			return
 		}
 
-		httpErrors.SendResponse(writer, "", http.StatusBadRequest)
+		httpResponse.SendResponse(writer, "", http.StatusBadRequest)
 		log.Println(err)
 		return
 	}
@@ -216,25 +212,25 @@ func (handler *JwtHandler) RefreshTokens(writer http.ResponseWriter, request *ht
 	claims, parsedToken, err := validateToken(refreshToken)
 
 	if err != nil {
-		httpErrors.SendResponse(writer, "Something wenth wrong while validating token", http.StatusBadRequest)
+		httpResponse.SendResponse(writer, "Something went wrong while validating token", http.StatusBadRequest)
 		log.Println(err)
 		return
 	}
 
 	if parsedToken.Valid {
-		httpErrors.SendResponse(writer, "Token is invalid", http.StatusBadRequest)
+		httpResponse.SendResponse(writer, "Token is invalid", http.StatusBadRequest)
 		return
 	}
 
 	if combinedHash != user.CombinedTokensHash {
-		httpErrors.SendResponse(writer, "Wrong token provided", http.StatusBadRequest)
+		httpResponse.SendResponse(writer, "Wrong token provided", http.StatusBadRequest)
 		return
 	}
 
 	currHashedIp, err := hashData(claims.ip)
 
 	if err != nil {
-		httpErrors.SendResponse(writer, "Something wenth wrong while hashing data", http.StatusBadRequest)
+		httpResponse.SendResponse(writer, "Something went wrong while hashing data", http.StatusBadRequest)
 		log.Println(err)
 		return
 	}
