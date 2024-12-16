@@ -60,23 +60,23 @@ type JWTClaim struct {
 	jwt.RegisteredClaims
 }
 
-func (handler *JwtHandler) getUser(request *http.Request) (models.User, error) {
+func (handler *JwtHandler) getUser(request *http.Request) (user models.User, err error) {
 	body := GetTokensBody{}
+	user = models.User{}
 	defer request.Body.Close()
 	decoder := json.NewDecoder(request.Body)
 	decoder.DisallowUnknownFields()
-	err := decoder.Decode(&body)
+	err = decoder.Decode(&body)
 
 	if err != nil {
-		return models.User{}, err
+		return
 	}
 
-	user := models.User{}
 	row := handler.DB.QueryRow(`SELECT * FROM "Users" WHERE "Users"."GUID" = $1`, body.GUID)
 	err = row.Scan(&user.GUID, &user.RefreshToken, &user.CombinedTokensHash, &user.IpHash, &user.Email)
 
 	if err != nil {
-		return models.User{}, err
+		return
 	}
 
 	return user, nil
@@ -241,55 +241,53 @@ func (handler *JwtHandler) RefreshTokens(writer http.ResponseWriter, request *ht
 
 	requestIpAddr := request.Header.Get("X-Forwarded-For")
 
-	generateTokens(writer, requestIpAddr)
+	_, _, err = generateTokens(writer, requestIpAddr)
+
+	if err != nil {
+		httpResponse.SendResponse(writer, "Something went wrong while generating tokens", http.StatusBadRequest)
+		log.Println(err)
+		return
+	}
 }
 
 func sendEmail() {
 	log.Println("Email sended")
 }
 
-func validateToken(token string) (*JWTClaim, *jwt.Token, error) {
-	claims := &JWTClaim{}
+func validateToken(token string) (claims *JWTClaim, parsedToken *jwt.Token, err error) {
+	claims = &JWTClaim{}
 
 	publicKeyInterface, _ := jwt.ParseRSAPublicKeyFromPEM([]byte(publicKey))
 
-	parsedToken, err := jwt.ParseWithClaims(token, claims, func(token *jwt.Token) (interface{}, error) {
+	parsedToken, err = jwt.ParseWithClaims(token, claims, func(token *jwt.Token) (interface{}, error) {
 		return publicKeyInterface, nil
 	})
 
-	if err != nil {
-		return claims, parsedToken, err
-	}
-
-	return claims, parsedToken, nil
+	return claims, parsedToken, err
 }
 
-func hashData(data string) (string, error) {
+func hashData(data string) (hash string, err error) {
 	hasher := sha1.New() //можно выбрать другой алгоритм исходя из требований безопасности
-	_, err := hasher.Write([]byte(data))
+	_, err = hasher.Write([]byte(data))
 
-	if err != nil {
-		return "", err
-	}
-
-	return base64.URLEncoding.EncodeToString(hasher.Sum(nil)), nil
+	return base64.URLEncoding.EncodeToString(hasher.Sum(nil)), err
 }
 
-func (tokens *Tokens) getTokensHash() (string, error) {
+func (tokens *Tokens) getTokensHash() (combinedTokensHash string, err error) {
 	return hashData(tokens.AccessToken + tokens.RefreshToken)
 }
 
-func generateTokens(writer http.ResponseWriter, requestIpAddr string) (string, string, error) {
+func generateTokens(writer http.ResponseWriter, requestIpAddr string) (base64RefreshToken string, combinedTokensHash string, err error) {
 	accessToken, err := generateJWT(requestIpAddr, AccessTokenLifeSpanInHours)
 
 	if err != nil {
-		return "", "", err
+		return
 	}
 
 	refreshToken, err := generateJWT(requestIpAddr, RefreshTokenLifeSpanInHours)
 
 	if err != nil {
-		return "", "", err
+		return
 	}
 
 	tokens := Tokens{accessToken, refreshToken}
@@ -297,7 +295,7 @@ func generateTokens(writer http.ResponseWriter, requestIpAddr string) (string, s
 	combinedHash, err := tokens.getTokensHash()
 
 	if err != nil {
-		return "", "", err
+		return
 	}
 
 	base64Token := base64.URLEncoding.EncodeToString([]byte(refreshToken))
@@ -325,9 +323,7 @@ func generateTokens(writer http.ResponseWriter, requestIpAddr string) (string, s
 	return base64Token, combinedHash, nil
 }
 
-func generateJWT(requestIpAddr string, hours int) (string, error) {
-	key, _ := jwt.ParseRSAPrivateKeyFromPEM([]byte(privateKey))
-
+func generateJWT(requestIpAddr string, hours int) (result string, err error) {
 	expirationTime := jwt.NewNumericDate(time.Now().Add(time.Hour * time.Duration(hours)))
 
 	claims := &JWTClaim{
@@ -338,12 +334,8 @@ func generateJWT(requestIpAddr string, hours int) (string, error) {
 	}
 
 	token := jwt.NewWithClaims(jwt.SigningMethodRS512, claims)
+	key, _ := jwt.ParseRSAPrivateKeyFromPEM([]byte(privateKey))
+	result, err = token.SignedString(key)
 
-	result, err := token.SignedString(key)
-
-	if err != nil {
-		return "", err
-	}
-
-	return result, nil
+	return result, err
 }
