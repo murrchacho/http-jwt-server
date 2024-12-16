@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"server/httpErrors"
 	"server/models"
 	"time"
 
@@ -59,14 +60,15 @@ type JWTClaim struct {
 	jwt.RegisteredClaims
 }
 
-func (handler *JwtHandler) getUser(request *http.Request) models.User {
+func (handler *JwtHandler) getUser(request *http.Request) (models.User, error) {
 	body := GetTokensBody{}
+	defer request.Body.Close()
 	decoder := json.NewDecoder(request.Body)
 	decoder.DisallowUnknownFields()
 	err := decoder.Decode(&body)
 
 	if err != nil {
-		log.Fatalf("Something went wrong: %v", err) //переделать фаталы на респонсы
+		return models.User{}, err
 	}
 
 	user := models.User{}
@@ -74,43 +76,87 @@ func (handler *JwtHandler) getUser(request *http.Request) models.User {
 	err = row.Scan(&user.GUID, &user.RefreshToken, &user.CombinedTokensHash, &user.IpHash, &user.Email)
 
 	if err != nil {
-		if err == sql.ErrNoRows {
-			log.Fatalf("User with such GUID not found")
-		}
-
-		log.Fatalf("Something went wrong while sql request: %v", err)
+		return models.User{}, err
 	}
 
-	return user
+	return user, nil
 }
 
 func (handler *JwtHandler) GetTokens(writer http.ResponseWriter, request *http.Request) {
+	writer.Header().Set("Content-Type", "application/json")
+
 	accessCookie, err := request.Cookie("accessToken")
 
 	if err != nil {
-
+		httpErrors.SendResponse(writer, "Something wenth wrong while generating access token", http.StatusBadRequest)
+		log.Println(err)
+		return
 	}
 
-	claims := validateToken(accessCookie.Value)
-	requestIpAddr := request.Header.Get("X-Forwarded-For") //помним что пользователь может установить любой ip тут
+	requestIpAddr := request.Header.Get("X-Forwarded-For") //может установить любой ip в этом заголовке на своей стороне
 
-	cookieIpAddr := claims.ip
+	requestIpHash, err := hashData(requestIpAddr)
 
-	user := handler.getUser(request)
+	if err != nil {
+		httpErrors.SendResponse(writer, "Something wenth wrong while hashing data", http.StatusBadRequest)
+		log.Println(err)
+		return
+	}
 
-	requestIpHash := hashData(requestIpAddr)
-	cookieIpHash := hashData(cookieIpAddr)
+	requestIpHashDiff := false
 
-	if requestIpHash != cookieIpHash {
+	if err == nil {
+		claims, parsedToken, err := validateToken(accessCookie.Value)
+
+		if err != nil {
+			httpErrors.SendResponse(writer, "Something wenth wrong while validating token", http.StatusBadRequest)
+			log.Println(err)
+			return
+		}
+
+		if !parsedToken.Valid {
+			httpErrors.SendResponse(writer, "Token is invalid", http.StatusBadRequest)
+			return
+		}
+
+		cookieIpAddr := claims.ip
+		cookieIpHash, err := hashData(cookieIpAddr)
+
+		if err != nil {
+			httpErrors.SendResponse(writer, "Something wenth wrong while hashing data", http.StatusBadRequest)
+			log.Println(err)
+			return
+		}
+
+		requestIpHashDiff = requestIpHash != cookieIpHash
+	}
+
+	user, err := handler.getUser(request)
+
+	if err != nil {
+		if err == sql.ErrNoRows {
+			httpErrors.SendResponse(writer, "User with such GUID not found", http.StatusBadRequest)
+			return
+		}
+
+		httpErrors.SendResponse(writer, "", http.StatusBadRequest)
+		log.Println(err)
+		return
+	}
+
+	userIpHashDiff := user.IpHash != "" && requestIpHash != user.IpHash
+
+	if (requestIpHashDiff || userIpHashDiff) && user.Email != "" {
 		go sendEmail()
-		log.Fatalf("Несовпадение ip")
 	}
 
-	if user.IpHash != "" && requestIpHash != user.IpHash && user.Email != "" {
-		go sendEmail()
-	}
+	refreshToken, combinedTokensHash, err := generateTokens(writer, requestIpAddr)
 
-	refreshToken, combinedTokensHash := generateTokens(writer, requestIpAddr)
+	if err != nil {
+		httpErrors.SendResponse(writer, "Something went wrong while generating access token", http.StatusBadRequest)
+		log.Println(err)
+		return
+	}
 
 	_, err = handler.DB.Exec(`UPDATE "Users" SET
 		"RefreshToken" = $1,
@@ -119,51 +165,94 @@ func (handler *JwtHandler) GetTokens(writer http.ResponseWriter, request *http.R
 		WHERE "GUID" = $4`, refreshToken, combinedTokensHash, requestIpHash, user.GUID)
 
 	if err != nil {
-		log.Fatalf("Something went wrong while sql request: %v", err)
+		httpErrors.SendResponse(writer, "", http.StatusBadRequest)
+		log.Println(err)
+		return
 	}
 }
 
 func (handler *JwtHandler) RefreshTokens(writer http.ResponseWriter, request *http.Request) {
+	writer.Header().Set("Content-Type", "application/json")
+
 	accessCookie, errAccessToken := request.Cookie("accessToken")
 	refreshCookie, errRefreshToken := request.Cookie("refreshToken")
 
 	if errAccessToken != nil || errRefreshToken != nil {
-		log.Fatalf("Can't get cookies from request")
+		httpErrors.SendResponse(writer, "Can't get cookies from request", http.StatusBadRequest)
+		return
 	}
 
 	decodedToken, err := base64.URLEncoding.DecodeString(refreshCookie.Value)
 
 	if err != nil {
-		log.Fatalf("Something went wrong: %v", err) //переделать фаталы на респонсы
+		httpErrors.SendResponse(writer, "", http.StatusBadRequest)
+		log.Println(err)
+		return
 	}
 
 	refreshToken := string(decodedToken)
 	tokens := Tokens{accessCookie.Value, refreshToken}
-	tokensHash := tokens.getTokensHash()
+	combinedHash, err := tokens.getTokensHash()
 
-	user := handler.getUser(request)
-
-	if tokensHash != user.CombinedTokensHash {
-		log.Fatalf("Wrong token provided: %v", err) //переделать фаталы на респонсы
+	if err != nil {
+		httpErrors.SendResponse(writer, "Something went wrong while hashing tokens", http.StatusBadRequest)
+		log.Println(err)
+		return
 	}
 
-	claims := validateToken(refreshToken)
-	currHashedIp := hashData(claims.ip)
+	user, err := handler.getUser(request)
+
+	if err != nil {
+		if err == sql.ErrNoRows {
+			httpErrors.SendResponse(writer, "User with such GUID not found", http.StatusBadRequest)
+			return
+		}
+
+		httpErrors.SendResponse(writer, "", http.StatusBadRequest)
+		log.Println(err)
+		return
+	}
+
+	claims, parsedToken, err := validateToken(refreshToken)
+
+	if err != nil {
+		httpErrors.SendResponse(writer, "Something wenth wrong while validating token", http.StatusBadRequest)
+		log.Println(err)
+		return
+	}
+
+	if parsedToken.Valid {
+		httpErrors.SendResponse(writer, "Token is invalid", http.StatusBadRequest)
+		return
+	}
+
+	if combinedHash != user.CombinedTokensHash {
+		httpErrors.SendResponse(writer, "Wrong token provided", http.StatusBadRequest)
+		return
+	}
+
+	currHashedIp, err := hashData(claims.ip)
+
+	if err != nil {
+		httpErrors.SendResponse(writer, "Something wenth wrong while hashing data", http.StatusBadRequest)
+		log.Println(err)
+		return
+	}
 
 	if currHashedIp != user.IpHash && user.Email != "" {
 		go sendEmail()
 	}
 
-	requestIpAddr := request.Header.Get("X-Forwarded-For") //можно ли переделать
+	requestIpAddr := request.Header.Get("X-Forwarded-For")
 
 	generateTokens(writer, requestIpAddr)
 }
 
 func sendEmail() {
-	log.Printf("Email sended")
+	log.Println("Email sended")
 }
 
-func validateToken(token string) *JWTClaim {
+func validateToken(token string) (*JWTClaim, *jwt.Token, error) {
 	claims := &JWTClaim{}
 
 	publicKeyInterface, _ := jwt.ParseRSAPublicKeyFromPEM([]byte(publicKey))
@@ -173,40 +262,48 @@ func validateToken(token string) *JWTClaim {
 	})
 
 	if err != nil {
-		log.Fatalf("Ошибка разбора: %v", err)
+		return claims, parsedToken, err
 	}
 
-	if !parsedToken.Valid {
-		log.Fatalf("Недействительный логин")
-	}
-
-	return claims
+	return claims, parsedToken, nil
 }
 
-func hashData(data string) string {
+func hashData(data string) (string, error) {
 	hasher := sha1.New() //можно выбрать другой алгоритм исходя из требований безопасности
 	_, err := hasher.Write([]byte(data))
 
-	if err != nil { // переделать на !ok?
-		log.Fatalf("Something went wrong while hashing data: %v", err)
+	if err != nil {
+		return "", err
 	}
 
-	return base64.URLEncoding.EncodeToString(hasher.Sum(nil))
+	return base64.URLEncoding.EncodeToString(hasher.Sum(nil)), nil
 }
 
-func (tokens *Tokens) getTokensHash() string {
+func (tokens *Tokens) getTokensHash() (string, error) {
 	return hashData(tokens.AccessToken + tokens.RefreshToken)
 }
 
-func generateTokens(writer http.ResponseWriter, requestIpAddr string) (string, string) {
-	writer.Header().Set("Content-Type", "application/json")
+func generateTokens(writer http.ResponseWriter, requestIpAddr string) (string, string, error) {
+	accessToken, err := generateJWT(requestIpAddr, AccessTokenLifeSpanInHours)
 
-	accessToken := getJwt(requestIpAddr, AccessTokenLifeSpanInHours)
-	refreshToken := getJwt(requestIpAddr, RefreshTokenLifeSpanInHours)
+	if err != nil {
+		return "", "", err
+	}
+
+	refreshToken, err := generateJWT(requestIpAddr, RefreshTokenLifeSpanInHours)
+
+	if err != nil {
+		return "", "", err
+	}
 
 	tokens := Tokens{accessToken, refreshToken}
 
-	combinedHash := tokens.getTokensHash()
+	combinedHash, err := tokens.getTokensHash()
+
+	if err != nil {
+		return "", "", err
+	}
+
 	base64Token := base64.URLEncoding.EncodeToString([]byte(refreshToken))
 
 	accessCookie := &http.Cookie{
@@ -229,10 +326,10 @@ func generateTokens(writer http.ResponseWriter, requestIpAddr string) (string, s
 
 	http.SetCookie(writer, refreshCookie)
 
-	return base64Token, combinedHash
+	return base64Token, combinedHash, nil
 }
 
-func getJwt(requestIpAddr string, hours int) string {
+func generateJWT(requestIpAddr string, hours int) (string, error) {
 	key, _ := jwt.ParseRSAPrivateKeyFromPEM([]byte(privateKey))
 
 	expirationTime := jwt.NewNumericDate(time.Now().Add(time.Hour * time.Duration(hours)))
@@ -249,8 +346,8 @@ func getJwt(requestIpAddr string, hours int) string {
 	result, err := token.SignedString(key)
 
 	if err != nil {
-		log.Fatalf("Error while generating accessToken: %v", err)
+		return "", err
 	}
 
-	return result
+	return result, nil
 }
