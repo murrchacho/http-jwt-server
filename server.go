@@ -4,9 +4,9 @@ import (
 	"database/sql"
 	"log"
 	"net/http"
-	"server/config"
-	"server/handlers"
-	"server/middleware"
+	"server/internal/config"
+	"server/internal/handlers"
+	"server/internal/middleware"
 )
 
 func main() {
@@ -33,7 +33,7 @@ func main() {
 
 	log.Printf("Server starting ...")
 
-	if err := http.ListenAndServe(":80", handler); err != nil {
+	if err := http.ListenAndServe(":62444", handler); err != nil {
 		log.Fatalf("Serve failed: %v", err)
 	}
 }
