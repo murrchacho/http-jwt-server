@@ -14,6 +14,7 @@ import (
 
 	"github.com/golang-jwt/jwt/v5"
 	_ "github.com/lib/pq"
+	"golang.org/x/crypto/bcrypt"
 )
 
 var configInfo = config.LoadConfig()
@@ -107,7 +108,7 @@ func (handler *JwtHandler) GetTokens(writer http.ResponseWriter, request *http.R
 		go sendEmail()
 	}
 
-	refreshToken, combinedTokensHash, err := generateTokens(writer, requestIpAddr)
+	bcryptRefreshToken, err := generateTokens(writer, requestIpAddr)
 
 	if err != nil {
 		httpResponse.SendResponse(writer, "Something went wrong while generating access token", http.StatusBadRequest)
@@ -117,9 +118,8 @@ func (handler *JwtHandler) GetTokens(writer http.ResponseWriter, request *http.R
 
 	_, err = handler.DB.Exec(`UPDATE "users" SET
 		"refresh_token" = $1,
-		"combined_tokens_hash" = $2,
-		"ip_hash" = $3
-		WHERE "guid" = $4`, refreshToken, combinedTokensHash, requestIpHash, user.GUID)
+		"ip_hash" = $2
+		WHERE "guid" = $3`, bcryptRefreshToken, requestIpHash, user.GUID)
 
 	if err != nil {
 		httpResponse.SendResponse(writer, "", http.StatusBadRequest)
@@ -155,13 +155,6 @@ func (handler *JwtHandler) RefreshTokens(writer http.ResponseWriter, request *ht
 
 	refreshToken := string(decodedToken)
 	tokens := Tokens{accessCookie.Value, refreshToken}
-	combinedHash, err := tokens.getTokensHash()
-
-	if err != nil {
-		httpResponse.SendResponse(writer, "Something went wrong while hashing tokens", http.StatusBadRequest)
-		log.Println(err)
-		return
-	}
 
 	user, err := handler.getUser(request)
 
@@ -189,7 +182,10 @@ func (handler *JwtHandler) RefreshTokens(writer http.ResponseWriter, request *ht
 		return
 	}
 
-	if combinedHash != user.CombinedTokensHash {
+	hashedKey, _ := hashData(tokens.AccessToken + tokens.RefreshToken)
+	err = bcrypt.CompareHashAndPassword([]byte(user.RefreshToken), []byte(hashedKey))
+
+	if err != nil {
 		httpResponse.SendResponse(writer, "Wrong token provided", http.StatusBadRequest)
 		return
 	}
@@ -208,7 +204,7 @@ func (handler *JwtHandler) RefreshTokens(writer http.ResponseWriter, request *ht
 
 	requestIpAddr := request.Header.Get("X-Forwarded-For")
 
-	_, _, err = generateTokens(writer, requestIpAddr)
+	_, err = generateTokens(writer, requestIpAddr)
 
 	if err != nil {
 		httpResponse.SendResponse(writer, "Something went wrong while generating tokens", http.StatusBadRequest)
@@ -230,7 +226,7 @@ func (handler *JwtHandler) getUser(request *http.Request) (user models.User, err
 	}
 
 	row := handler.DB.QueryRow(`SELECT * FROM "users" WHERE "users"."guid" = $1`, body.GUID)
-	err = row.Scan(&user.GUID, &user.RefreshToken, &user.CombinedTokensHash, &user.IpHash, &user.Email)
+	err = row.Scan(&user.GUID, &user.RefreshToken, &user.IpHash, &user.Email)
 
 	if err != nil {
 		return
@@ -263,11 +259,23 @@ func hashData(data string) (hash string, err error) {
 	return base64.URLEncoding.EncodeToString(hasher.Sum(nil)), err
 }
 
-func (tokens *Tokens) getTokensHash() (combinedTokensHash string, err error) {
-	return hashData(tokens.AccessToken + tokens.RefreshToken)
+func (tokens *Tokens) getBcryptRefreshToken() (bcryptRefreshToken string, err error) {
+	hashedKey, err := hashData(tokens.AccessToken + tokens.RefreshToken)
+
+	if err != nil {
+		return
+	}
+
+	refreshToken, err := bcrypt.GenerateFromPassword([]byte(hashedKey), bcrypt.DefaultCost)
+
+	if err != nil {
+		return
+	}
+
+	return string(refreshToken), nil
 }
 
-func generateTokens(writer http.ResponseWriter, requestIpAddr string) (base64RefreshToken, combinedTokensHash string, err error) {
+func generateTokens(writer http.ResponseWriter, requestIpAddr string) (combinedTokensHash string, err error) {
 	accessToken, err := generateJWT(requestIpAddr, AccessTokenLifeSpanInHours)
 
 	if err != nil {
@@ -282,7 +290,7 @@ func generateTokens(writer http.ResponseWriter, requestIpAddr string) (base64Ref
 
 	tokens := Tokens{accessToken, refreshToken}
 
-	combinedHash, err := tokens.getTokensHash()
+	bcryptRefreshToken, err := tokens.getBcryptRefreshToken()
 
 	if err != nil {
 		return
@@ -310,7 +318,7 @@ func generateTokens(writer http.ResponseWriter, requestIpAddr string) (base64Ref
 
 	http.SetCookie(writer, refreshCookie)
 
-	return base64Token, combinedHash, nil
+	return bcryptRefreshToken, nil
 }
 
 func generateJWT(requestIpAddr string, hours int) (result string, err error) {
