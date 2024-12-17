@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"server/config"
 	"server/httpResponse"
 	"server/models"
 	"time"
@@ -15,29 +16,9 @@ import (
 	_ "github.com/lib/pq"
 )
 
-// для тестов
-var privateKey string = `-----BEGIN RSA PRIVATE KEY-----
-MIICXQIBAAKBgQCEeKZ+5+Nny+hSeaQH0fVZEM9aFjfXdlAedkxZ2WRMwVE/h/H3
-/zJNkfJ1PaW2U/P2jQQbeDO0N4ayh2No8N87qK/2fGv5UcwEYLJUtYpIyg+Axb5r
-8lW2q4VEWIk9ZnvUMxj/n+K4sbi4QL4sFGX+Rd9iI/opFFia5gZq3Ih0TQIDAQAB
-AoGAUSsL+V5kfEj4hPB7jT8csgIWywAqHx8jYEbj6XnGdzFMczz9ChOX4ue2RBgN
-3XX7Wep1xc8U/yu2oNVMGBTe8m2JfwXmCyUCyIiSN38/1kb0+tX3BV30Qb+ZM2Ds
-prISxE7V3ERmq+ZeQ5ANJWtCA1PIoZ1aXTJawukSJlZn/RECQQDdv3hWTbkFxJ8K
-141Gvor3Zv5OB966sBP8ezAnfnbb5NFa95CcltjLQrlDB2D6w4THUArdxBCqrbfR
-joiY8UbvAkEAmO7vBKeXKGr3M97OxIHoXZCAj9MkWlfIwcn6HdCCXGywxfXb4sOz
-I+DBKbk037N3i30s9MnHPWyh0zsrukFYgwJBAKE//9j6ceZg4ap3rrNYEiPwUFMb
-4/pr2kzKo+zESNiEnz0AM7e69fFxFtlIP1x62044xX4YemozIy2O8YQOSB8CQQCY
-W2EPmA6FG5tOt6fyKSFfJTiPEGBlCJNeTGO7FCDrBvVNIlR/I0vycFS/xl0gh2CP
-PJNvAx5U2UaWc5pqofMVAkAp5lXWLXrzj47S3XY/YGEv5eZV5cZe4jFchH2Ydeip
-XUQD8iUUrQNbAfEXOxvify4Knnjsdr+uKcva2bEbq8xD
------END RSA PRIVATE KEY-----`
+var configInfo = config.LoadConfig()
 
-var publicKey string = `-----BEGIN PUBLIC KEY-----
-MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQCEeKZ+5+Nny+hSeaQH0fVZEM9a
-FjfXdlAedkxZ2WRMwVE/h/H3/zJNkfJ1PaW2U/P2jQQbeDO0N4ayh2No8N87qK/2
-fGv5UcwEYLJUtYpIyg+Axb5r8lW2q4VEWIk9ZnvUMxj/n+K4sbi4QL4sFGX+Rd9i
-I/opFFia5gZq3Ih0TQIDAQAB
------END PUBLIC KEY-----`
+var privateKey, publicKey = configInfo.PrivateKey, configInfo.PublicKey
 
 const AccessTokenLifeSpanInHours = 1
 const RefreshTokenLifeSpanInHours = 10
@@ -56,7 +37,7 @@ type GetTokensBody struct {
 }
 
 type JWTClaim struct {
-	ip string
+	Ip string
 	jwt.RegisteredClaims
 }
 
@@ -83,7 +64,11 @@ func (handler *JwtHandler) getUser(request *http.Request) (user models.User, err
 }
 
 func (handler *JwtHandler) GetTokens(writer http.ResponseWriter, request *http.Request) {
-	writer.Header().Set("Content-Type", "application/json")
+	if request.Method != http.MethodPost {
+		writer.Header().Set("Allow", http.MethodPost)
+		httpResponse.SendResponse(writer, "Incorrect HTTP-method", http.StatusBadRequest)
+		return
+	}
 
 	requestIpAddr := request.Header.Get("X-Forwarded-For") //может установить любой ip в этом заголовке на своей стороне
 
@@ -113,7 +98,7 @@ func (handler *JwtHandler) GetTokens(writer http.ResponseWriter, request *http.R
 			return
 		}
 
-		cookieIpAddr := claims.ip
+		cookieIpAddr := claims.Ip
 		cookieIpHash, err := hashData(cookieIpAddr)
 
 		if err != nil {
@@ -168,12 +153,16 @@ func (handler *JwtHandler) GetTokens(writer http.ResponseWriter, request *http.R
 }
 
 func (handler *JwtHandler) RefreshTokens(writer http.ResponseWriter, request *http.Request) {
-	writer.Header().Set("Content-Type", "application/json")
+	if request.Method != http.MethodPost {
+		writer.Header().Set("Allow", http.MethodPost)
+		httpResponse.SendResponse(writer, "Incorrect HTTP-method", http.StatusBadRequest)
+		return
+	}
 
-	accessCookie, errAccessToken := request.Cookie("accessToken")
-	refreshCookie, errRefreshToken := request.Cookie("refreshToken")
+	accessCookie, errAccessCookie := request.Cookie("accessToken")
+	refreshCookie, errRefreshCookie := request.Cookie("refreshToken")
 
-	if errAccessToken != nil || errRefreshToken != nil {
+	if errAccessCookie != nil || errRefreshCookie != nil {
 		httpResponse.SendResponse(writer, "Can't get cookies from request", http.StatusBadRequest)
 		return
 	}
@@ -217,7 +206,7 @@ func (handler *JwtHandler) RefreshTokens(writer http.ResponseWriter, request *ht
 		return
 	}
 
-	if parsedToken.Valid {
+	if !parsedToken.Valid {
 		httpResponse.SendResponse(writer, "Token is invalid", http.StatusBadRequest)
 		return
 	}
@@ -227,7 +216,7 @@ func (handler *JwtHandler) RefreshTokens(writer http.ResponseWriter, request *ht
 		return
 	}
 
-	currHashedIp, err := hashData(claims.ip)
+	currHashedIp, err := hashData(claims.Ip)
 
 	if err != nil {
 		httpResponse.SendResponse(writer, "Something went wrong while hashing data", http.StatusBadRequest)
@@ -257,7 +246,11 @@ func sendEmail() {
 func validateToken(token string) (claims *JWTClaim, parsedToken *jwt.Token, err error) {
 	claims = &JWTClaim{}
 
-	publicKeyInterface, _ := jwt.ParseRSAPublicKeyFromPEM([]byte(publicKey))
+	publicKeyInterface, err := jwt.ParseRSAPublicKeyFromPEM([]byte(publicKey))
+
+	if err != nil {
+		return nil, nil, err
+	}
 
 	parsedToken, err = jwt.ParseWithClaims(token, claims, func(token *jwt.Token) (interface{}, error) {
 		return publicKeyInterface, nil
@@ -268,7 +261,8 @@ func validateToken(token string) (claims *JWTClaim, parsedToken *jwt.Token, err 
 
 func hashData(data string) (hash string, err error) {
 	hasher := sha1.New() //можно выбрать другой алгоритм исходя из требований безопасности
-	_, err = hasher.Write([]byte(data))
+
+	_, err = hasher.Write([]byte(data + configInfo.ServerSalt))
 
 	return base64.URLEncoding.EncodeToString(hasher.Sum(nil)), err
 }
@@ -277,7 +271,7 @@ func (tokens *Tokens) getTokensHash() (combinedTokensHash string, err error) {
 	return hashData(tokens.AccessToken + tokens.RefreshToken)
 }
 
-func generateTokens(writer http.ResponseWriter, requestIpAddr string) (base64RefreshToken string, combinedTokensHash string, err error) {
+func generateTokens(writer http.ResponseWriter, requestIpAddr string) (base64RefreshToken, combinedTokensHash string, err error) {
 	accessToken, err := generateJWT(requestIpAddr, AccessTokenLifeSpanInHours)
 
 	if err != nil {
@@ -326,15 +320,20 @@ func generateTokens(writer http.ResponseWriter, requestIpAddr string) (base64Ref
 func generateJWT(requestIpAddr string, hours int) (result string, err error) {
 	expirationTime := jwt.NewNumericDate(time.Now().Add(time.Hour * time.Duration(hours)))
 
-	claims := &JWTClaim{
-		ip: requestIpAddr,
+	claims := JWTClaim{
+		Ip: requestIpAddr,
 		RegisteredClaims: jwt.RegisteredClaims{
 			ExpiresAt: expirationTime,
 		},
 	}
 
 	token := jwt.NewWithClaims(jwt.SigningMethodRS512, claims)
-	key, _ := jwt.ParseRSAPrivateKeyFromPEM([]byte(privateKey))
+	key, err := jwt.ParseRSAPrivateKeyFromPEM([]byte(privateKey))
+
+	if err != nil {
+		return
+	}
+
 	result, err = token.SignedString(key)
 
 	return result, err

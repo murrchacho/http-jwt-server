@@ -6,11 +6,13 @@ import (
 	"net/http"
 	"server/config"
 	"server/handlers"
+	"server/middleware"
 )
 
 func main() {
-	config := config.LoadConfig()
-	connStr := "user=" + config.DBUser + " password=" + config.DBPassword + " dbname=" + config.DBName + " sslmode=disable port=" + config.DBPort
+	configInfo := config.LoadConfig()
+
+	connStr := "user=" + configInfo.DBUser + " password=" + configInfo.DBPassword + " dbname=" + configInfo.DBName + " sslmode=disable port=" + configInfo.DBPort
 
 	db, err := sql.Open("postgres", connStr)
 
@@ -22,12 +24,16 @@ func main() {
 
 	jwtHandler := &handlers.JwtHandler{DB: db}
 
-	http.HandleFunc("/getTokens", jwtHandler.GetTokens)
-	http.HandleFunc("/refreshTokens", jwtHandler.RefreshTokens)
+	mux := http.NewServeMux()
 
-	log.Printf("Server starting on port ...")
+	mux.HandleFunc("/getTokens", jwtHandler.GetTokens)
+	mux.HandleFunc("/refreshTokens", jwtHandler.RefreshTokens)
 
-	if err := http.ListenAndServe(":80", nil); err != nil {
+	handler := middleware.SetJSONHeader(mux)
+
+	log.Printf("Server starting ...")
+
+	if err := http.ListenAndServe(":80", handler); err != nil {
 		log.Fatalf("Serve failed: %v", err)
 	}
 }
