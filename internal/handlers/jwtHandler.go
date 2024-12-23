@@ -61,34 +61,6 @@ func (handler *JwtHandler) GetTokens(writer http.ResponseWriter, request *http.R
 
 	requestIpHashDiff := false
 
-	accessCookie, err := request.Cookie("accessToken")
-
-	if err == nil {
-		claims, parsedToken, err := validateToken(accessCookie.Value)
-
-		if err != nil {
-			httpResponse.SendResponse(writer, "Something went wrong while validating token", http.StatusBadRequest)
-			log.Println(err)
-			return
-		}
-
-		if !parsedToken.Valid {
-			httpResponse.SendResponse(writer, "Token is invalid", http.StatusBadRequest)
-			return
-		}
-
-		cookieIpAddr := claims.Ip
-		cookieIpHash, err := hashData(cookieIpAddr)
-
-		if err != nil {
-			httpResponse.SendResponse(writer, "Something went wrong while hashing data", http.StatusBadRequest)
-			log.Println(err)
-			return
-		}
-
-		requestIpHashDiff = requestIpHash != cookieIpHash
-	}
-
 	user, err := handler.getUser(request)
 
 	if err != nil {
